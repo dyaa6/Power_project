@@ -1,5 +1,6 @@
 // home_screen.dart
 import 'package:flutter/material.dart';
+import 'package:power/screens/add_device_screen.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart'; // For date/time formatting
 
@@ -15,7 +16,7 @@ class HomeScreen extends StatelessWidget {
     return Consumer<DeviceProvider>(
       builder: (context, deviceProvider, child) {
         return Scaffold(
-          appBar: AppBar(title: const Text('Power Monitor')),
+          appBar: AppBar(title: const Text('Smart Energy Mitter')),
           body: Padding(
             padding: const EdgeInsets.all(16.0),
             child: _buildBody(context, deviceProvider),
@@ -65,8 +66,10 @@ class HomeScreen extends StatelessWidget {
             icon: const Icon(Icons.add),
             label: const Text('Add Device'),
             onPressed: () {
-              // Example navigation to your “Add Device” screen/tab
-              DefaultTabController.of(context).animateTo(1);
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => AddDeviceScreen()),
+              );
             },
             style: ElevatedButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -141,43 +144,50 @@ class HomeScreen extends StatelessWidget {
     return Expanded(
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal, // Horizontal scroll
-        child: SingleChildScrollView(
-          scrollDirection: Axis.vertical, // Nested vertical scroll
-          child: DataTable(
-            columns: const [
-              DataColumn(label: Text('Date')),
-              DataColumn(label: Text('Time')),
-              DataColumn(label: Text('Voltage (V)')),
-              DataColumn(label: Text('Current (A)')),
-              DataColumn(label: Text('Power (W)')),
-              DataColumn(label: Text('Apparent (VA)')),
-              DataColumn(label: Text('PF')),
-              DataColumn(label: Text('Energy (Wh)')),
-              DataColumn(label: Text('Freq (Hz)')),
-            ],
-            rows:
-                readings.map((reading) {
-                  final dateStr = DateFormat(
-                    'yyyy-MM-dd',
-                  ).format(reading.dateTime);
-                  final timeStr = DateFormat(
-                    'HH:mm:ss',
-                  ).format(reading.dateTime);
+        child: IntrinsicWidth(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.vertical, // Nested vertical scroll
+            child: DataTable(
+              // Tighter spacing for minimum column widths
+              columnSpacing: 12,
+              horizontalMargin: 8,
+              columns: const [
+                DataColumn(label: Text('Date')),
+                DataColumn(label: Text('Time')),
+                DataColumn(label: Text('V')), // VOLTAGE
+                DataColumn(label: Text('A')), // CURRENT
+                DataColumn(label: Text('W')), // POWER
+                DataColumn(label: Text('VA')), //APPERANT
+                DataColumn(label: Text('PF')), //POWER FACTOR
+                DataColumn(label: Text('Wh')), //ENERGY
+                DataColumn(label: Text('Hz')), //FREQ.
+              ],
+              rows:
+                  readings.map((reading) {
+                    final dateStr = DateFormat(
+                      'yyyy-MM-dd',
+                    ).format(reading.dateTime);
+                    final timeStr = DateFormat(
+                      'HH:mm:ss',
+                    ).format(reading.dateTime);
 
-                  return DataRow(
-                    cells: [
-                      DataCell(Text(dateStr)),
-                      DataCell(Text(timeStr)),
-                      DataCell(Text(reading.voltage.toStringAsFixed(1))),
-                      DataCell(Text(reading.current.toStringAsFixed(3))),
-                      DataCell(Text(reading.power.toStringAsFixed(1))),
-                      DataCell(Text(reading.apparentPower.toStringAsFixed(1))),
-                      DataCell(Text(reading.powerFactor.toStringAsFixed(2))),
-                      DataCell(Text(reading.energy.toStringAsFixed(1))),
-                      DataCell(Text(reading.frequency.toStringAsFixed(1))),
-                    ],
-                  );
-                }).toList(),
+                    return DataRow(
+                      cells: [
+                        DataCell(Text(dateStr)),
+                        DataCell(Text(timeStr)),
+                        DataCell(Text(reading.voltage.toStringAsFixed(1))),
+                        DataCell(Text(reading.current.toStringAsFixed(3))),
+                        DataCell(Text(reading.power.toStringAsFixed(1))),
+                        DataCell(
+                          Text(reading.apparentPower.toStringAsFixed(1)),
+                        ),
+                        DataCell(Text(reading.powerFactor.toStringAsFixed(2))),
+                        DataCell(Text(reading.energy.toStringAsFixed(1))),
+                        DataCell(Text(reading.frequency.toStringAsFixed(1))),
+                      ],
+                    );
+                  }).toList(),
+            ),
           ),
         ),
       ),

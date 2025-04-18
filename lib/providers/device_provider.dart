@@ -1,3 +1,4 @@
+// providers/device_provider.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
@@ -6,7 +7,7 @@ import '../models/power_data.dart';
 import '../services/storage_service.dart';
 import '../services/esp32_service.dart';
 
-// State management class using ChangeNotifier
+/// State management class using ChangeNotifier
 class DeviceProvider with ChangeNotifier {
   final StorageService _storageService = StorageService();
   final Esp32Service _esp32Service = Esp32Service();
@@ -23,6 +24,7 @@ class DeviceProvider with ChangeNotifier {
 
   /// The most recent reading
   PowerData? _currentPowerData;
+
   bool _isLoading = false;
   bool _isFirebaseLoading = false;
   String? _errorMessage;
@@ -30,8 +32,16 @@ class DeviceProvider with ChangeNotifier {
   StreamSubscription<DatabaseEvent>? _firebaseSubscription;
 
   // --------------------
+  // NEW Fields for cost calculation
+  // --------------------
+
+  /// Electricity rate in IQD per kWh (default or loaded from settings)
+  double _electricityRateIQD = 75.0;
+
+  // --------------------
   // Getters
   // --------------------
+
   List<Device> get devices => _devices;
   Device? get selectedDevice => _selectedDevice;
   List<PowerData> get powerDataList => _powerDataList;
@@ -40,11 +50,42 @@ class DeviceProvider with ChangeNotifier {
   bool get isFirebaseLoading => _isFirebaseLoading;
   String? get errorMessage => _errorMessage;
 
+  /// Instantaneous power from the latest reading, in watts.
+  double get currentPowerWatts => _currentPowerData?.power ?? 0.0;
+
+  /// Total energy used this month, in kWh,
+  /// computed by integrating power over time between readings.
+  double get monthlyConsumption {
+    if (_powerDataList.length < 2) return 0.0;
+
+    double totalKWh = 0.0;
+
+    for (int i = 1; i < _powerDataList.length; i++) {
+      final prev = _powerDataList[i - 1];
+      final curr = _powerDataList[i];
+
+      // time difference in hours
+      final elapsedHours =
+          curr.dateTime.difference(prev.dateTime).inSeconds / 3600.0;
+
+      // average power in kW
+      final avgPowerKW = (prev.power + curr.power) / 2.0 / 1000.0;
+
+      totalKWh += avgPowerKW * elapsedHours;
+    }
+
+    return totalKWh;
+  }
+
+  /// Current electricity rate in IQD per kWh
+  double get electricityRateIQD => _electricityRateIQD;
+
   // --------------------
   // Constructor
   // --------------------
   DeviceProvider() {
     _loadDevices();
+    // Optionally: _loadElectricityRate();
   }
 
   // --------------------
@@ -54,11 +95,9 @@ class DeviceProvider with ChangeNotifier {
     _setLoading(true);
     _devices = await _storageService.loadDevices();
     if (_devices.isNotEmpty) {
-      // Select the first device by default if any exist
       _selectDevice(_devices.first, notify: false);
     }
     _setLoading(false);
-    print("Loaded devices: $_devices");
   }
 
   // --------------------
@@ -67,10 +106,7 @@ class DeviceProvider with ChangeNotifier {
   Future<void> addDevice(String deviceId, {String? name}) async {
     if (deviceId.isEmpty) return;
 
-    // Avoid adding duplicates
     if (_devices.any((d) => d.id == deviceId)) {
-      print("Device $deviceId already exists.");
-      // Optionally select the existing device
       _selectDevice(_devices.firstWhere((d) => d.id == deviceId));
       return;
     }
@@ -79,9 +115,7 @@ class DeviceProvider with ChangeNotifier {
     _devices.add(newDevice);
     await _storageService.saveDevices(_devices);
 
-    // Select the newly added device and start listening
     _selectDevice(newDevice);
-    print("Added device: $newDevice");
   }
 
   /// Exposed method to select a device
@@ -93,29 +127,24 @@ class DeviceProvider with ChangeNotifier {
   // Internal selection + Firebase listener
   // --------------------
   void _selectDevice(Device? device, {bool notify = true}) {
-    if (_selectedDevice == device) return; // No change
+    if (_selectedDevice == device) return;
 
     _selectedDevice = device;
     _currentPowerData = null;
-    _powerDataList.clear(); // Clear old readings
-    _cancelFirebaseSubscription(); // Stop listening to the old device
+    _powerDataList.clear();
+    _cancelFirebaseSubscription();
 
     if (_selectedDevice != null) {
-      // Listen to the new device's entire "readings" child
       _listenToFirebase(_selectedDevice!.id);
     }
 
-    if (notify) {
-      notifyListeners();
-    }
-    print("Selected device: $_selectedDevice");
+    if (notify) notifyListeners();
   }
 
   void _listenToFirebase(String deviceId) {
     if (deviceId.isEmpty) return;
 
     _setFirebaseLoading(true);
-    // Point reference to: /power/<deviceId>/readings
     final deviceRef = _database.ref('/power/$deviceId/readings');
 
     _firebaseSubscription = deviceRef.onValue.listen(
@@ -123,43 +152,26 @@ class DeviceProvider with ChangeNotifier {
         _setFirebaseLoading(false);
 
         if (event.snapshot.exists && event.snapshot.value != null) {
-          try {
-            // The 'readings' node is typically a map
-            final rawMap = event.snapshot.value as Map<dynamic, dynamic>;
-            final List<PowerData> newReadings = [];
+          final rawMap = event.snapshot.value as Map<dynamic, dynamic>;
+          final List<PowerData> newReadings = [];
 
-            rawMap.forEach((key, value) {
-              if (value is Map) {
-                try {
-                  final mapData = Map<dynamic, dynamic>.from(value);
-                  final reading = PowerData.fromFirebaseMap(mapData);
-                  newReadings.add(reading);
-                } catch (ex) {
-                  print("Error parsing child '$key': $ex");
-                }
+          rawMap.forEach((key, value) {
+            if (value is Map) {
+              try {
+                newReadings.add(PowerData.fromFirebaseMap(Map.from(value)));
+              } catch (_) {
+                // skip invalid
               }
-            });
+            }
+          });
 
-            // Optional: sort by dateTime ascending
-            newReadings.sort((a, b) => a.dateTime.compareTo(b.dateTime));
-
-            _powerDataList = newReadings;
-            _currentPowerData =
-                _powerDataList.isNotEmpty ? _powerDataList.last : null;
-
-            _clearError();
-            print(
-              "Received ${_powerDataList.length} reading(s) from Firebase for $deviceId.",
-            );
-          } catch (e) {
-            print("Error parsing Firebase data for $deviceId: $e");
-            _setError("Error parsing data from Firebase.");
-            _powerDataList.clear();
-            _currentPowerData = null;
-          }
+          newReadings.sort((a, b) => a.dateTime.compareTo(b.dateTime));
+          _powerDataList = newReadings;
+          _currentPowerData =
+              _powerDataList.isNotEmpty ? _powerDataList.last : null;
+          _clearError();
         } else {
-          print("No data found in Firebase for $deviceId/readings");
-          _setError("No data received from Firebase yet for this device.");
+          _setError("No data received from Firebase yet.");
           _powerDataList.clear();
           _currentPowerData = null;
         }
@@ -168,7 +180,6 @@ class DeviceProvider with ChangeNotifier {
       },
       onError: (error) {
         _setFirebaseLoading(false);
-        print("Firebase listener error for $deviceId: $error");
         _setError("Failed to listen to Firebase data.");
         _powerDataList.clear();
         _currentPowerData = null;
@@ -177,38 +188,21 @@ class DeviceProvider with ChangeNotifier {
     );
   }
 
-  /// Configure ESP32 and add device
   Future<bool> configureAndAddDevice(String ssid, String password) async {
     _setLoading(true);
     _clearError();
     try {
-      // 1. Get ID from ESP32
-      print("Attempting to get Device ID from ESP32...");
       final deviceId = await _esp32Service.getDeviceId();
-      print("Received Device ID: $deviceId");
-
-      if (deviceId.isEmpty) {
-        throw Exception("Received empty Device ID from ESP32.");
-      }
-
-      // 2. Send Credentials to ESP32
-      print("Attempting to send credentials to ESP32...");
-      final bool credentialsSent = await _esp32Service.sendCredentials(
-        ssid,
-        password,
-      );
-      print("Credentials sent status: $credentialsSent");
-
-      if (credentialsSent) {
-        // 3. Add device to local storage and state
-        await addDevice(deviceId); // This also selects the device
+      if (deviceId.isEmpty) throw Exception("Empty Device ID.");
+      final sent = await _esp32Service.sendCredentials(ssid, password);
+      if (sent) {
+        await addDevice(deviceId);
         _setLoading(false);
         return true;
       } else {
-        throw Exception("ESP32 reported failure after sending credentials.");
+        throw Exception("ESP32 failed after credentials.");
       }
     } catch (e) {
-      print("Configuration failed: $e");
       _setError(e.toString());
       _setLoading(false);
       return false;
@@ -227,7 +221,7 @@ class DeviceProvider with ChangeNotifier {
   void _setFirebaseLoading(bool value) {
     if (_isFirebaseLoading == value) return;
     _isFirebaseLoading = value;
-    // Only call notifyListeners() if your UI depends on isFirebaseLoading changing
+    // UI can listen if needed
   }
 
   void _setError(String? message) {
@@ -245,7 +239,6 @@ class DeviceProvider with ChangeNotifier {
   void _cancelFirebaseSubscription() {
     _firebaseSubscription?.cancel();
     _firebaseSubscription = null;
-    print("Cancelled Firebase subscription.");
   }
 
   @override
@@ -255,36 +248,28 @@ class DeviceProvider with ChangeNotifier {
   }
 
   // --------------------
-  // NEW #1: Check if a device ID exists in Firebase
+  // Utility Methods
   // --------------------
+
+  /// Check if a device ID exists in Firebase
   Future<bool> checkDeviceExists(String deviceId) async {
-    try {
-      // For example, check if the path "/power/<deviceId>" exists
-      final ref = _database.ref('/power/$deviceId');
-      final snapshot = await ref.get();
-      return snapshot.exists;
-    } catch (e) {
-      // Throw so that calling code can catch/handle it
-      throw Exception("No connection with the server or Firebase error: $e");
-    }
+    final ref = _database.ref('/power/$deviceId');
+    final snapshot = await ref.get();
+    return snapshot.exists;
   }
 
-  // --------------------
-  // NEW #2: Add device by ID only
-  // --------------------
+  /// Add device by ID only
   Future<bool> addDeviceById(String deviceId) async {
     _clearError();
     if (deviceId.isEmpty) {
       _setError("Device ID can't be empty.");
       return false;
     }
-
     try {
-      // Reuse existing logic to add the device
       await addDevice(deviceId);
       return true;
     } catch (e) {
-      _setError("Could not add device by ID. Error: $e");
+      _setError("Could not add device: $e");
       return false;
     }
   }
