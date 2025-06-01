@@ -107,8 +107,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
               label: 'Add Device',
             ),
             BottomNavigationBarItem(
-              icon: Icon(Icons.money_outlined),
-              activeIcon: Icon(Icons.money),
+              icon: Icon(Icons.attach_money_outlined),
+              activeIcon: Icon(Icons.attach_money),
               label: 'Cost',
             ),
             BottomNavigationBarItem(

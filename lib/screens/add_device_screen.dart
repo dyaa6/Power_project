@@ -1,7 +1,9 @@
 // screens/add_device_screen.dart
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
-import '../providers/device_provider.dart';
+import 'package:firebase_database/firebase_database.dart';
+import '../models/device.dart';
+import '../services/storage_service.dart';
+import '../services/esp32_service.dart';
 
 class AddDeviceScreen extends StatefulWidget {
   const AddDeviceScreen({super.key});
@@ -16,6 +18,13 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
   final _passwordController = TextEditingController();
   final _deviceIdController = TextEditingController();
 
+  final StorageService _storageService = StorageService();
+  final Esp32Service _esp32Service = Esp32Service();
+  final FirebaseDatabase _database = FirebaseDatabase.instance;
+
+  bool _isLoading = false;
+  String? _errorMessage;
+
   @override
   void dispose() {
     _ssidController.dispose();
@@ -26,13 +35,36 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
 
   Future<void> _submitConfiguration() async {
     if (!_formKey.currentState!.validate()) return;
+
+    setState(() {
+      _errorMessage = null;
+      _isLoading = true;
+    });
+
     final ssid = _ssidController.text.trim();
     final password = _passwordController.text;
-    final provider = Provider.of<DeviceProvider>(context, listen: false);
 
-    final success = await provider.configureAndAddDevice(ssid, password);
-    if (mounted) {
-      if (success) {
+    try {
+      // 1. Ask ESP32 for its generated device ID
+      final deviceId = await _esp32Service.getDeviceId();
+      if (deviceId.isEmpty) throw Exception("Empty Device ID from ESP32.");
+
+      // 2. Send home-WiFi credentials to ESP32
+      final sent = await _esp32Service.sendCredentials(ssid, password);
+      if (!sent) throw Exception("ESP32 did not accept credentials.");
+
+      // 3. Load existing devices from local storage
+      final existingDevices = await _storageService.loadDevices();
+      final alreadyAdded = existingDevices.any((d) => d.id == deviceId);
+
+      if (!alreadyAdded) {
+        // 4. Append new Device to local list & save
+        final newDevice = Device(id: deviceId, name: null);
+        existingDevices.add(newDevice);
+        await _storageService.saveDevices(existingDevices);
+      }
+      // 5. Show success and pop
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Device configured successfully!'),
@@ -40,15 +72,16 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
           ),
         );
         Navigator.pop(context);
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Configuration failed: ${provider.errorMessage ?? "Unknown error"}',
-            ),
-            backgroundColor: Colors.red,
-          ),
-        );
+      }
+    } catch (e) {
+      setState(() {
+        _errorMessage = e.toString();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
       }
     }
   }
@@ -65,11 +98,16 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
       return;
     }
 
-    final provider = Provider.of<DeviceProvider>(context, listen: false);
+    setState(() {
+      _errorMessage = null;
+      _isLoading = true;
+    });
 
     try {
-      final exists = await provider.checkDeviceExists(deviceId);
-      if (!exists) {
+      // 1. Check Firebase if this device ID exists under /sensorData
+      final ref = _database.ref('/sensorData/$deviceId');
+      final snapshot = await ref.get();
+      if (!snapshot.exists) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('This device does not exist.'),
@@ -79,8 +117,18 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
         return;
       }
 
-      final success = await provider.addDeviceById(deviceId);
-      if (success && mounted) {
+      // 2. Load existing devices from local storage
+      final existingDevices = await _storageService.loadDevices();
+      final alreadyAdded = existingDevices.any((d) => d.id == deviceId);
+      if (!alreadyAdded) {
+        // 3. Append new Device to local list & save
+        final newDevice = Device(id: deviceId, name: null);
+        existingDevices.add(newDevice);
+        await _storageService.saveDevices(existingDevices);
+      }
+
+      // 4. Show success and pop
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Device added successfully!'),
@@ -88,15 +136,6 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
           ),
         );
         Navigator.pop(context);
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Failed to add device: ${provider.errorMessage ?? "Unknown error"}',
-            ),
-            backgroundColor: Colors.red,
-          ),
-        );
       }
     } catch (_) {
       if (mounted) {
@@ -107,13 +146,17 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
           ),
         );
       }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final provider = Provider.of<DeviceProvider>(context);
-
     return Scaffold(
       appBar: AppBar(title: const Text('Add New Device')),
       body: SingleChildScrollView(
@@ -158,16 +201,16 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
                 obscureText: true,
               ),
               const SizedBox(height: 24),
-              if (provider.errorMessage != null && !provider.isLoading)
+              if (_errorMessage != null && !_isLoading)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 10),
                   child: Text(
-                    'Error: ${provider.errorMessage}',
+                    'Error: $_errorMessage',
                     style: const TextStyle(color: Colors.red),
                     textAlign: TextAlign.center,
                   ),
                 ),
-              provider.isLoading
+              _isLoading
                   ? const Center(child: CircularProgressIndicator())
                   : ElevatedButton.icon(
                     icon: const Icon(Icons.save),

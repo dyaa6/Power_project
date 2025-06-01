@@ -171,9 +171,7 @@ class DeviceProvider with ChangeNotifier {
                 );
                 entriesMap.forEach((pushKey, entryVal) {
                   if (entryVal is Map) {
-                    final entryMap = Map<String, dynamic>.from(
-                      entryVal as Map<dynamic, dynamic>,
-                    );
+                    final entryMap = Map<String, dynamic>.from(entryVal);
                     try {
                       newReadings.add(PowerData.fromFirebaseMap(entryMap));
                     } catch (_) {

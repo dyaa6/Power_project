@@ -1,13 +1,18 @@
+// screens/home_screen.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:intl/intl.dart';
+import 'package:power/screens/add_device_screen.dart';
+
+import '../models/device.dart';
+import '../services/storage_service.dart';
 
 // Firebase configuration
 const DB_URL =
     'https://epower-44f2e-default-rtdb.asia-southeast1.firebasedatabase.app';
-const AUTH = 'G7FMO4LjkSOHrs5Ms5it3m1aHKKfOsb57Z9SzP2e';
+const AUTH = 'G7FMO4LjkSOHrs5Ms5it3aHKKfOsb57Z9SzP2e';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,168 +21,333 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
-  static const double costPerKWh = 0.20;
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final FirebaseDatabase _database = FirebaseDatabase(databaseURL: DB_URL);
-  StreamSubscription<DatabaseEvent>? _dataSub;
 
-  List<String> _devices = [];
-  String? _selectedDevice;
+  List<Device> _storedDevices = [];
+  List<String> _deviceIds = [];
+  String? _selectedDeviceId;
 
   bool _loadingDevices = true;
   bool _loadingData = false;
   String? _error;
 
-  List<PowerData> _readings = [];
   PowerData? _current;
-  bool _showTable = false;
-  Timer? _timer;
+  double _totalEnergySinceReset = 0.0; // (in Wh)
 
   @override
   void initState() {
     super.initState();
-    _initFirebase();
-    _timer = Timer.periodic(const Duration(milliseconds: 200), (_) {
-      if (mounted) setState(() {});
-    });
-  }
-
-  Future<void> _initFirebase() async {
-    await Firebase.initializeApp();
-    _fetchDevices();
-  }
-
-  Future<void> _fetchDevices() async {
-    setState(() {
-      _loadingDevices = true;
-      _error = null;
-    });
-    try {
-      final ref = _database.ref('sensorData');
-      final snap = await ref.get();
-      if (snap.exists && snap.value != null) {
-        final map = Map<String, dynamic>.from(snap.value as Map);
-        _devices = map.keys.toList();
-      } else {
-        _devices = [];
-      }
-    } catch (e) {
-      _error = 'Failed to load devices';
-    }
-    setState(() {
-      _loadingDevices = false;
-    });
-  }
-
-  void _onDeviceSelected(String? id) {
-    if (_selectedDevice == id) return;
-    _cancelSubscription();
-    setState(() {
-      _selectedDevice = id;
-      _readings.clear();
-      _current = null;
-      _error = null;
-    });
-    if (id != null) _listenToData(id);
-  }
-
-  void _listenToData(String deviceId) {
-    setState(() => _loadingData = true);
-    final ref = _database.ref('sensorData/$deviceId');
-    _dataSub = ref.onValue.listen(
-      (event) {
-        setState(() {
-          _loadingData = false;
-          _error = null;
-          _readings = [];
-        });
-        if (event.snapshot.exists && event.snapshot.value != null) {
-          final raw = Map<String, dynamic>.from(event.snapshot.value as Map);
-          raw.forEach((year, yMap) {
-            final months = Map<String, dynamic>.from(yMap as Map);
-            months.forEach((month, mMap) {
-              final days = Map<String, dynamic>.from(mMap as Map);
-              days.forEach((day, dMap) {
-                final entries = Map<String, dynamic>.from(dMap as Map);
-                entries.forEach((key, val) {
-                  final entry = Map<String, dynamic>.from(val as Map);
-                  try {
-                    final pd = PowerData.fromFirebaseMap(entry);
-                    _readings.add(pd);
-                  } catch (_) {}
-                });
-              });
-            });
-          });
-          _readings.sort((a, b) => a.dateTime.compareTo(b.dateTime));
-          setState(() {
-            _current = _readings.isNotEmpty ? _readings.last : null;
-          });
-        } else {
-          setState(() {
-            _error = 'No data yet';
-            _readings.clear();
-            _current = null;
-          });
-        }
-      },
-      onError: (_) {
-        setState(() {
-          _loadingData = false;
-          _error = 'Error listening to data';
-        });
-      },
-    );
-  }
-
-  void _cancelSubscription() {
-    _dataSub?.cancel();
-    _dataSub = null;
+    WidgetsBinding.instance.addObserver(this);
+    _initFirebaseAndLoad();
   }
 
   @override
   void dispose() {
-    _cancelSubscription();
-    _timer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // When coming back from AddDeviceScreen, reload stored devices
+    if (state == AppLifecycleState.resumed) {
+      _loadStoredDevices();
+    }
+  }
+
+  Future<void> _initFirebaseAndLoad() async {
+    await Firebase.initializeApp();
+    await _loadStoredDevices();
+  }
+
+  Future<void> _loadStoredDevices() async {
+    setState(() {
+      _loadingDevices = true;
+      _error = null;
+      _storedDevices = [];
+      _deviceIds = [];
+      _selectedDeviceId = null;
+      _current = null;
+      _totalEnergySinceReset = 0.0;
+    });
+
+    try {
+      final devices = await StorageService().loadDevices();
+      _storedDevices = devices;
+      _deviceIds = _storedDevices.map((d) => d.id).toList();
+
+      if (_deviceIds.length == 1) {
+        _selectedDeviceId = _deviceIds.first;
+        await _fetchLatestAndTotal(_selectedDeviceId!);
+      }
+    } catch (e) {
+      _error = 'Failed to load stored devices: $e';
+      _storedDevices = [];
+      _deviceIds = [];
+      _selectedDeviceId = null;
+    }
+
+    if (mounted) {
+      setState(() {
+        _loadingDevices = false;
+      });
+    }
+  }
+
+  void _onDeviceSelected(String? id) {
+    if (_selectedDeviceId == id) return;
+
+    setState(() {
+      _selectedDeviceId = id;
+      _current = null;
+      _totalEnergySinceReset = 0.0;
+      _error = null;
+    });
+
+    if (id != null) {
+      _fetchLatestAndTotal(id);
+    }
+  }
+
+  Future<void> _fetchLatestAndTotal(String deviceId) async {
+    setState(() {
+      _loadingData = true;
+      _error = null;
+      _current = null;
+      _totalEnergySinceReset = 0.0;
+    });
+
+    try {
+      // 1) Read “last_reset” under sensorData/deviceId
+      final resetRef = _database.ref('sensorData/$deviceId/last_reset');
+      final resetSnap = await resetRef.get();
+      DateTime? lastResetDateTime;
+      if (resetSnap.exists && resetSnap.value != null) {
+        final resetStr = resetSnap.value as String;
+        try {
+          lastResetDateTime = DateFormat('yyyy/MM/dd HH:mm:ss').parse(resetStr);
+        } catch (_) {
+          lastResetDateTime = null;
+        }
+      }
+
+      // 2) Read the device root to enumerate which “year” keys are there
+      final deviceRootRef = _database.ref('sensorData/$deviceId');
+      final deviceRootSnap = await deviceRootRef.get();
+      if (!deviceRootSnap.exists || deviceRootSnap.value == null) {
+        if (mounted) {
+          setState(() {
+            _loadingData = false;
+            _current = null;
+            _totalEnergySinceReset = 0.0;
+            _error = 'No data yet for this device';
+          });
+        }
+        return;
+      }
+
+      final rawDeviceMap = Map<String, dynamic>.from(
+        deviceRootSnap.value as Map,
+      );
+
+      // 3) Gather all year‐keys (as ints), ignoring “last_reset”
+      final yearKeys =
+          rawDeviceMap.keys
+              .where((k) => k != 'last_reset')
+              .map((k) => int.tryParse(k))
+              .where((v) => v != null)
+              .map((v) => v!)
+              .toList()
+            ..sort();
+
+      List<PowerData> filteredReadings = [];
+
+      // 4) For each year that is >= lastReset.year, gather months→days→entries
+      for (final year in yearKeys) {
+        if (lastResetDateTime != null && year < lastResetDateTime.year) {
+          continue;
+        }
+        final yearRef = _database.ref('sensorData/$deviceId/$year');
+        final yearSnap = await yearRef.get();
+        if (!yearSnap.exists || yearSnap.value == null) continue;
+
+        final monthsMap = Map<String, dynamic>.from(yearSnap.value as Map);
+        for (final monthKey in monthsMap.keys) {
+          final monthIdx = int.tryParse(monthKey);
+          if (monthIdx == null) continue;
+          if (lastResetDateTime != null &&
+              year == lastResetDateTime.year &&
+              monthIdx < lastResetDateTime.month) {
+            continue;
+          }
+
+          final monthRef = _database.ref(
+            'sensorData/$deviceId/$year/$monthKey',
+          );
+          final monthSnap = await monthRef.get();
+          if (!monthSnap.exists || monthSnap.value == null) continue;
+
+          final daysMap = Map<String, dynamic>.from(monthSnap.value as Map);
+          for (final dayKey in daysMap.keys) {
+            final dayIdx = int.tryParse(dayKey);
+            if (dayIdx == null) continue;
+            if (lastResetDateTime != null &&
+                year == lastResetDateTime.year &&
+                monthIdx == lastResetDateTime.month &&
+                dayIdx < lastResetDateTime.day) {
+              continue;
+            }
+
+            final dayRef = _database.ref(
+              'sensorData/$deviceId/$year/$monthKey/$dayKey',
+            );
+            final daySnap = await dayRef.get();
+            if (!daySnap.exists || daySnap.value == null) continue;
+
+            final entriesMap = Map<String, dynamic>.from(daySnap.value as Map);
+            for (final entryKey in entriesMap.keys) {
+              final entryVal = entriesMap[entryKey];
+              if (entryVal is! Map) continue;
+              final entryMap = Map<String, dynamic>.from(entryVal);
+              try {
+                final pd = PowerData.fromFirebaseMap(entryMap);
+                if (lastResetDateTime != null &&
+                    pd.dateTime.isBefore(lastResetDateTime)) {
+                  continue;
+                }
+                filteredReadings.add(pd);
+              } catch (_) {
+                // ignore parse errors
+              }
+            }
+          }
+        }
+      }
+
+      // 5) Sort them, pick the latest, and sum energy (Wh)
+      filteredReadings.sort((a, b) => a.dateTime.compareTo(b.dateTime));
+      final latest = filteredReadings.isNotEmpty ? filteredReadings.last : null;
+
+      double totalSum = 0.0;
+      for (final pd in filteredReadings) {
+        totalSum += pd.energy;
+      }
+
+      if (mounted) {
+        setState(() {
+          _loadingData = false;
+          _current = latest;
+          _totalEnergySinceReset = totalSum;
+          if (latest == null) {
+            _error = 'No data since last reset';
+          }
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadingData = false;
+          _error = 'Error fetching data: $e';
+        });
+      }
+    }
+  }
+
+  double _calculateTieredCostIQD(double totalKWh) {
+    double remaining = totalKWh;
+    double cost = 0.0;
+
+    final tier1 = remaining.clamp(0.0, 1500.0);
+    cost += tier1 * 10;
+    remaining -= tier1;
+    if (remaining <= 0) return cost;
+
+    final tier2 = remaining.clamp(0.0, 1500.0);
+    cost += tier2 * 35;
+    remaining -= tier2;
+    if (remaining <= 0) return cost;
+
+    final tier3 = remaining.clamp(0.0, 1000.0);
+    cost += tier3 * 80;
+    remaining -= tier3;
+    if (remaining <= 0) return cost;
+
+    cost += remaining * 120;
+    return cost;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Smart Energy Meter')),
+      appBar: AppBar(
+        title: const Text('Smart Energy Meter'),
+        actions: [
+          // If you have a button to navigate to AddDeviceScreen:
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'Add Device',
+            onPressed: () async {
+              // Push AddDeviceScreen directly, then reload on return
+              await Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => AddDeviceScreen()),
+              );
+              _loadStoredDevices();
+            },
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (_loadingDevices)
-              const Center(child: CircularProgressIndicator())
-            else if (_error != null && _devices.isEmpty)
+            if (_loadingDevices) ...[
+              const Center(child: CircularProgressIndicator()),
+            ] else if ((_error != null && _deviceIds.isEmpty)) ...[
               Center(
                 child: Text(
                   'Error: $_error',
                   style: const TextStyle(color: Colors.red),
                 ),
-              )
-            else ...[
-              DropdownButtonFormField<String>(
-                value: _selectedDevice,
-                hint: const Text('Select a Device'),
-                isExpanded: true,
-                items:
-                    _devices
-                        .map(
-                          (id) => DropdownMenuItem(value: id, child: Text(id)),
-                        )
-                        .toList(),
-                onChanged: _onDeviceSelected,
-                decoration: const InputDecoration(
-                  labelText: 'Device',
-                  border: OutlineInputBorder(),
+              ),
+            ] else if (_deviceIds.isEmpty) ...[
+              const Center(
+                child: Text(
+                  'No devices added.\nTap + to add a device.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 16, color: Colors.black54),
                 ),
               ),
-              const SizedBox(height: 20),
+            ] else ...[
+              // If exactly one stored device, display its ID
+              if (_deviceIds.length == 1) ...[
+                Text(
+                  'Device: ${_deviceIds.first}',
+                  style: const TextStyle(fontSize: 16),
+                ),
+                const SizedBox(height: 20),
+              ] else ...[
+                DropdownButtonFormField<String>(
+                  value: _selectedDeviceId,
+                  hint: const Text('Select a Device'),
+                  isExpanded: true,
+                  items:
+                      _deviceIds
+                          .map(
+                            (id) =>
+                                DropdownMenuItem(value: id, child: Text(id)),
+                          )
+                          .toList(),
+                  onChanged: _onDeviceSelected,
+                  decoration: const InputDecoration(
+                    labelText: 'Device',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 20),
+              ],
               Expanded(child: _buildContent()),
             ],
           ],
@@ -187,131 +357,100 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildContent() {
-    if (_selectedDevice == null)
+    if (_selectedDeviceId == null) {
       return const Center(child: Text('Please select a device.'));
-    if (_loadingData && _readings.isEmpty)
+    }
+    if (_loadingData && _current == null) {
       return const Center(child: CircularProgressIndicator());
-    if (_error != null && _readings.isEmpty)
+    }
+    if (_error != null && _current == null) {
       return Center(
         child: Text(
           'Error: $_error',
           style: const TextStyle(color: Colors.red),
         ),
       );
+    }
 
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: _buildCard(
-                  Icons.electrical_services,
-                  'Current (A)',
-                  _current?.current.toStringAsFixed(3) ?? '--',
-                ),
+    final totalKWh = _totalEnergySinceReset / 1000;
+    final costIQD = _calculateTieredCostIQD(totalKWh);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // First row: Current, Energy, Cost (IQD)
+        Row(
+          children: [
+            Expanded(
+              child: _buildCard(
+                Icons.electrical_services,
+                'Current (A)',
+                _current?.current.toStringAsFixed(3) ?? '--',
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _buildCard(
-                  Icons.battery_charging_full,
-                  'Energy (Wh)',
-                  _current?.energy.toStringAsFixed(1) ?? '--',
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _buildCard(
-                  Icons.attach_money,
-                  'Cost',
-                  _current != null
-                      ? '\$${(_current!.energy / 1000 * costPerKWh).toStringAsFixed(2)}'
-                      : '--',
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          if (_current != null) ...[
-            Text(
-              'Last Update: ${DateFormat('HH:mm:ss').format(_current!.dateTime)}',
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 14, color: Colors.black54),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _buildCard(
+                Icons.battery_charging_full,
+                'Energy (Wh)',
+                _current?.energy.toStringAsFixed(1) ?? '--',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _buildCard(
+                Icons.attach_money,
+                'Cost (IQD)',
+                _current != null ? costIQD.toStringAsFixed(0) : '--',
+              ),
+            ),
           ],
-          Row(
-            children: [
-              Expanded(
-                child: _buildCard(
-                  Icons.flash_on,
-                  'Voltage (V)',
-                  _current?.voltage.toStringAsFixed(1) ?? '--',
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _buildCard(
-                  Icons.speed,
-                  'Frequency (Hz)',
-                  _current?.frequency.toStringAsFixed(1) ?? '--',
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _buildCard(
-                  Icons.list_alt,
-                  'Power Factor',
-                  _current?.powerFactor.toStringAsFixed(2) ?? '--',
-                ),
-              ),
-            ],
+        ),
+        const SizedBox(height: 12),
+        if (_current != null) ...[
+          Text(
+            'Last Update: ${DateFormat('HH:mm:ss').format(_current!.dateTime)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 14, color: Colors.black54),
           ),
           const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => setState(() => _showTable = !_showTable),
-            child: Text(_showTable ? 'Hide Readings' : 'Show All Readings'),
-          ),
-          if (_showTable) ...[
-            const SizedBox(height: 12),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: DataTable(
-                columns: const [
-                  DataColumn(label: Text('Date')),
-                  DataColumn(label: Text('Time')),
-                  DataColumn(label: Text('V')),
-                  DataColumn(label: Text('A')),
-                  DataColumn(label: Text('W')),
-                  DataColumn(label: Text('VA')),
-                  DataColumn(label: Text('PF')),
-                  DataColumn(label: Text('Wh')),
-                  DataColumn(label: Text('Hz')),
-                ],
-                rows:
-                    _readings.map((r) {
-                      final date = DateFormat('yyyy-MM-dd').format(r.dateTime);
-                      final time = DateFormat('HH:mm:ss').format(r.dateTime);
-                      return DataRow(
-                        cells: [
-                          DataCell(Text(date)),
-                          DataCell(Text(time)),
-                          DataCell(Text(r.voltage.toStringAsFixed(1))),
-                          DataCell(Text(r.current.toStringAsFixed(3))),
-                          DataCell(Text(r.power.toStringAsFixed(1))),
-                          DataCell(Text(r.apparentPower.toStringAsFixed(1))),
-                          DataCell(Text(r.powerFactor.toStringAsFixed(2))),
-                          DataCell(Text(r.energy.toStringAsFixed(1))),
-                          DataCell(Text(r.frequency.toStringAsFixed(1))),
-                        ],
-                      );
-                    }).toList(),
+        ],
+        // Second row: Voltage, Frequency, Power Factor
+        Row(
+          children: [
+            Expanded(
+              child: _buildCard(
+                Icons.flash_on,
+                'Voltage (V)',
+                _current?.voltage.toStringAsFixed(1) ?? '--',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _buildCard(
+                Icons.speed,
+                'Frequency (Hz)',
+                _current?.frequency.toStringAsFixed(1) ?? '--',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _buildCard(
+                Icons.list_alt,
+                'Power Factor',
+                _current?.powerFactor.toStringAsFixed(2) ?? '--',
               ),
             ),
           ],
-        ],
-      ),
+        ),
+        const SizedBox(height: 16),
+        // Row: Total Energy Since Reset (Wh)
+        _buildCard(
+          Icons.timeline,
+          'Total Energy Since Reset (Wh)',
+          _totalEnergySinceReset.toStringAsFixed(1),
+        ),
+      ],
     );
   }
 
@@ -336,7 +475,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-// Model class for PowerData (add in ../models/power_data.dart)
+/// Model class for PowerData
 class PowerData {
   final double voltage;
   final double current;
