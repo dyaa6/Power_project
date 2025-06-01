@@ -504,7 +504,7 @@ class _ElectricityCostScreenState extends State<ElectricityCostScreen> {
       appBar: AppBar(
         title: const Text('تكلفة الكهرباء'),
         centerTitle: true,
-        backgroundColor: Theme.of(context).primaryColor,
+        backgroundColor: const Color(0xFF075E54),
         foregroundColor: Colors.white,
       ),
       body: Padding(

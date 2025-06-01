@@ -252,7 +252,7 @@ class _GraphScreenState extends State<GraphScreen> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Power Consumption Graphs'),
-        backgroundColor: Colors.blue.shade700,
+        backgroundColor: const Color(0xFF075E54),
         foregroundColor: Colors.white,
       ),
       body: Padding(padding: const EdgeInsets.all(16.0), child: _buildBody()),
@@ -330,7 +330,10 @@ class _GraphScreenState extends State<GraphScreen> with WidgetsBindingObserver {
               padding: const EdgeInsets.all(16.0),
               child: Row(
                 children: [
-                  Icon(Icons.electrical_services, color: Colors.blue),
+                  Icon(
+                    Icons.electrical_services,
+                    color: const Color(0xFF075E54),
+                  ),
                   SizedBox(width: 8),
                   Text(
                     'Device: ${_devices.first}',
@@ -569,7 +572,7 @@ class _GraphScreenState extends State<GraphScreen> with WidgetsBindingObserver {
   Widget _buildStatItem(String label, String value, IconData icon) {
     return Column(
       children: [
-        Icon(icon, color: Colors.blue, size: 20),
+        Icon(icon, color: const Color(0xFF075E54), size: 20),
         SizedBox(height: 4),
         Text(
           value,
@@ -708,7 +711,7 @@ class _GraphScreenState extends State<GraphScreen> with WidgetsBindingObserver {
                     LineChartBarData(
                       spots: spots,
                       isCurved: true,
-                      color: Colors.blue,
+                      color: const Color(0xFF075E54),
                       barWidth: 3,
                       dotData: FlDotData(
                         show: filtered.length <= 20,
@@ -716,14 +719,14 @@ class _GraphScreenState extends State<GraphScreen> with WidgetsBindingObserver {
                             (spot, percent, barData, index) =>
                                 FlDotCirclePainter(
                                   radius: 4,
-                                  color: Colors.blue,
+                                  color: const Color(0xFF075E54),
                                   strokeWidth: 2,
                                   strokeColor: Colors.white,
                                 ),
                       ),
                       belowBarData: BarAreaData(
                         show: true,
-                        color: Colors.blue.withOpacity(0.1),
+                        color: const Color(0xFF075E54).withOpacity(0.1),
                       ),
                     ),
                   ],

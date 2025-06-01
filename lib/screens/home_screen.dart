@@ -5,7 +5,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:intl/intl.dart';
 import 'package:power/screens/add_device_screen.dart';
-
+import 'package:power/screens/scan.dart';
 import '../models/device.dart';
 import '../services/storage_service.dart';
 
@@ -29,7 +29,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _selectedDeviceId;
 
   bool _loadingDevices = true;
-  bool _loadingData = false;
+  bool _loadingLatestReadings = false;
+  bool _loadingTotalEnergy = false;
   String? _error;
 
   PowerData? _current;
@@ -70,6 +71,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _selectedDeviceId = null;
       _current = null;
       _totalEnergySinceReset = 0.0;
+      _loadingLatestReadings = false;
+      _loadingTotalEnergy = false;
     });
 
     try {
@@ -79,7 +82,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       if (_deviceIds.length == 1) {
         _selectedDeviceId = _deviceIds.first;
-        await _fetchLatestAndTotal(_selectedDeviceId!);
+        // Start fetching data in background
+        _fetchDataInSequence(_selectedDeviceId!);
       }
     } catch (e) {
       _error = 'Failed to load stored devices: $e';
@@ -103,23 +107,113 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _current = null;
       _totalEnergySinceReset = 0.0;
       _error = null;
+      _loadingLatestReadings = false;
+      _loadingTotalEnergy = false;
     });
 
     if (id != null) {
-      _fetchLatestAndTotal(id);
+      _fetchDataInSequence(id);
     }
   }
 
-  Future<void> _fetchLatestAndTotal(String deviceId) async {
+  // Fetch data in sequence: latest readings first, then total energy
+  Future<void> _fetchDataInSequence(String deviceId) async {
+    // First, fetch latest readings
+    await _fetchLatestReadings(deviceId);
+
+    // Then, fetch total energy in background
+    _fetchTotalEnergy(deviceId);
+  }
+
+  Future<void> _fetchLatestReadings(String deviceId) async {
     setState(() {
-      _loadingData = true;
+      _loadingLatestReadings = true;
       _error = null;
-      _current = null;
-      _totalEnergySinceReset = 0.0;
     });
 
     try {
-      // 1) Read “last_reset” under sensorData/deviceId
+      // Get all data for the device
+      final deviceRootRef = _database.ref('sensorData/$deviceId');
+      final deviceRootSnap = await deviceRootRef.get();
+
+      if (!deviceRootSnap.exists || deviceRootSnap.value == null) {
+        if (mounted) {
+          setState(() {
+            _loadingLatestReadings = false;
+            _error = 'No data yet for this device';
+          });
+        }
+        return;
+      }
+
+      final rawDeviceMap = Map<String, dynamic>.from(
+        deviceRootSnap.value as Map,
+      );
+
+      PowerData? latestReading;
+      DateTime? latestDateTime;
+
+      // Recursively search through all nested data to find the most recent entry
+      void searchForLatestReading(dynamic data, [String path = '']) {
+        if (data is Map) {
+          final dataMap = Map<String, dynamic>.from(data);
+
+          // Check if this is a leaf node (contains sensor data)
+          if (dataMap.containsKey('timestamp') &&
+              dataMap.containsKey('voltage') &&
+              dataMap.containsKey('current')) {
+            try {
+              final pd = PowerData.fromFirebaseMap(dataMap);
+              if (latestDateTime == null ||
+                  pd.dateTime.isAfter(latestDateTime!)) {
+                latestDateTime = pd.dateTime;
+                latestReading = pd;
+              }
+            } catch (e) {
+              print('Error parsing entry at $path: $e');
+            }
+          } else {
+            // Continue searching in nested maps
+            for (final key in dataMap.keys) {
+              if (key != 'last_reset') {
+                // Skip the reset timestamp
+                searchForLatestReading(dataMap[key], '$path/$key');
+              }
+            }
+          }
+        }
+      }
+
+      // Start the recursive search
+      searchForLatestReading(rawDeviceMap);
+
+      if (mounted) {
+        setState(() {
+          _loadingLatestReadings = false;
+          _current = latestReading;
+          if (latestReading == null) {
+            _error = 'No readings found';
+          }
+        });
+      }
+    } catch (e) {
+      print('Error in _fetchLatestReadings: $e');
+      if (mounted) {
+        setState(() {
+          _loadingLatestReadings = false;
+          _error = 'Error fetching latest readings: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _fetchTotalEnergy(String deviceId) async {
+    setState(() {
+      _loadingTotalEnergy = true;
+    });
+
+    try {
+      // Read "last_reset" under sensorData/deviceId
       final resetRef = _database.ref('sensorData/$deviceId/last_reset');
       final resetSnap = await resetRef.get();
       DateTime? lastResetDateTime;
@@ -132,16 +226,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 2) Read the device root to enumerate which “year” keys are there
+      // Get all device data
       final deviceRootRef = _database.ref('sensorData/$deviceId');
       final deviceRootSnap = await deviceRootRef.get();
       if (!deviceRootSnap.exists || deviceRootSnap.value == null) {
         if (mounted) {
           setState(() {
-            _loadingData = false;
-            _current = null;
-            _totalEnergySinceReset = 0.0;
-            _error = 'No data yet for this device';
+            _loadingTotalEnergy = false;
           });
         }
         return;
@@ -151,84 +242,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         deviceRootSnap.value as Map,
       );
 
-      // 3) Gather all year‐keys (as ints), ignoring “last_reset”
-      final yearKeys =
-          rawDeviceMap.keys
-              .where((k) => k != 'last_reset')
-              .map((k) => int.tryParse(k))
-              .where((v) => v != null)
-              .map((v) => v!)
-              .toList()
-            ..sort();
-
       List<PowerData> filteredReadings = [];
 
-      // 4) For each year that is >= lastReset.year, gather months→days→entries
-      for (final year in yearKeys) {
-        if (lastResetDateTime != null && year < lastResetDateTime.year) {
-          continue;
-        }
-        final yearRef = _database.ref('sensorData/$deviceId/$year');
-        final yearSnap = await yearRef.get();
-        if (!yearSnap.exists || yearSnap.value == null) continue;
+      // Recursively collect all readings after reset time
+      void collectReadings(dynamic data) {
+        if (data is Map) {
+          final dataMap = Map<String, dynamic>.from(data);
 
-        final monthsMap = Map<String, dynamic>.from(yearSnap.value as Map);
-        for (final monthKey in monthsMap.keys) {
-          final monthIdx = int.tryParse(monthKey);
-          if (monthIdx == null) continue;
-          if (lastResetDateTime != null &&
-              year == lastResetDateTime.year &&
-              monthIdx < lastResetDateTime.month) {
-            continue;
-          }
-
-          final monthRef = _database.ref(
-            'sensorData/$deviceId/$year/$monthKey',
-          );
-          final monthSnap = await monthRef.get();
-          if (!monthSnap.exists || monthSnap.value == null) continue;
-
-          final daysMap = Map<String, dynamic>.from(monthSnap.value as Map);
-          for (final dayKey in daysMap.keys) {
-            final dayIdx = int.tryParse(dayKey);
-            if (dayIdx == null) continue;
-            if (lastResetDateTime != null &&
-                year == lastResetDateTime.year &&
-                monthIdx == lastResetDateTime.month &&
-                dayIdx < lastResetDateTime.day) {
-              continue;
-            }
-
-            final dayRef = _database.ref(
-              'sensorData/$deviceId/$year/$monthKey/$dayKey',
-            );
-            final daySnap = await dayRef.get();
-            if (!daySnap.exists || daySnap.value == null) continue;
-
-            final entriesMap = Map<String, dynamic>.from(daySnap.value as Map);
-            for (final entryKey in entriesMap.keys) {
-              final entryVal = entriesMap[entryKey];
-              if (entryVal is! Map) continue;
-              final entryMap = Map<String, dynamic>.from(entryVal);
-              try {
-                final pd = PowerData.fromFirebaseMap(entryMap);
-                if (lastResetDateTime != null &&
-                    pd.dateTime.isBefore(lastResetDateTime)) {
-                  continue;
-                }
+          // Check if this is a leaf node (contains sensor data)
+          if (dataMap.containsKey('timestamp') &&
+              dataMap.containsKey('energy')) {
+            try {
+              final pd = PowerData.fromFirebaseMap(dataMap);
+              if (lastResetDateTime == null ||
+                  pd.dateTime.isAfter(lastResetDateTime) ||
+                  pd.dateTime.isAtSameMomentAs(lastResetDateTime)) {
                 filteredReadings.add(pd);
-              } catch (_) {
-                // ignore parse errors
+              }
+            } catch (e) {
+              print('Error parsing reading for total energy: $e');
+            }
+          } else {
+            // Continue searching in nested maps
+            for (final key in dataMap.keys) {
+              if (key != 'last_reset') {
+                collectReadings(dataMap[key]);
               }
             }
           }
         }
       }
 
-      // 5) Sort them, pick the latest, and sum energy (Wh)
-      filteredReadings.sort((a, b) => a.dateTime.compareTo(b.dateTime));
-      final latest = filteredReadings.isNotEmpty ? filteredReadings.last : null;
+      // Collect all readings
+      collectReadings(rawDeviceMap);
 
+      // Sum energy (Wh)
       double totalSum = 0.0;
       for (final pd in filteredReadings) {
         totalSum += pd.energy;
@@ -236,19 +284,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       if (mounted) {
         setState(() {
-          _loadingData = false;
-          _current = latest;
+          _loadingTotalEnergy = false;
           _totalEnergySinceReset = totalSum;
-          if (latest == null) {
-            _error = 'No data since last reset';
-          }
         });
       }
     } catch (e) {
+      print('Error in _fetchTotalEnergy: $e');
       if (mounted) {
         setState(() {
-          _loadingData = false;
-          _error = 'Error fetching data: $e';
+          _loadingTotalEnergy = false;
         });
       }
     }
@@ -282,13 +326,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Smart Energy Meter'),
+        backgroundColor: const Color(0xFF075E54),
+        foregroundColor: Colors.white,
         actions: [
-          // If you have a button to navigate to AddDeviceScreen:
           IconButton(
             icon: const Icon(Icons.add),
             tooltip: 'Add Device',
             onPressed: () async {
-              // Push AddDeviceScreen directly, then reload on return
               await Navigator.push(
                 context,
                 MaterialPageRoute(builder: (context) => AddDeviceScreen()),
@@ -360,117 +404,183 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_selectedDeviceId == null) {
       return const Center(child: Text('Please select a device.'));
     }
-    if (_loadingData && _current == null) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_error != null && _current == null) {
-      return Center(
-        child: Text(
-          'Error: $_error',
-          style: const TextStyle(color: Colors.red),
-        ),
-      );
-    }
 
     final totalKWh = _totalEnergySinceReset / 1000;
     final costIQD = _calculateTieredCostIQD(totalKWh);
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // First row: Current, Energy, Cost (IQD)
-        Row(
-          children: [
-            Expanded(
-              child: _buildCard(
-                Icons.electrical_services,
-                'Current (A)',
-                _current?.current.toStringAsFixed(3) ?? '--',
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // First row: Current, Energy, Cost (IQD)
+          Row(
+            children: [
+              Expanded(
+                child: _buildCard(
+                  Icons.electrical_services,
+                  'Current (A)',
+                  _loadingLatestReadings
+                      ? null
+                      : _current?.current.toStringAsFixed(3) ?? '--',
+                ),
               ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildCard(
-                Icons.battery_charging_full,
-                'Energy (Wh)',
-                _current?.energy.toStringAsFixed(1) ?? '--',
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildCard(
+                  Icons.battery_charging_full,
+                  'Energy (Wh)',
+                  _loadingLatestReadings
+                      ? null
+                      : _current?.energy.toStringAsFixed(1) ?? '--',
+                ),
               ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildCard(
-                Icons.attach_money,
-                'Cost (IQD)',
-                _current != null ? costIQD.toStringAsFixed(0) : '--',
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildCard(
+                  Icons.attach_money,
+                  'Cost (IQD)',
+                  _loadingLatestReadings
+                      ? null
+                      : (_current != null ? costIQD.toStringAsFixed(0) : '--'),
+                ),
               ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // Second row: Voltage, Frequency, Power Factor
+          Row(
+            children: [
+              Expanded(
+                child: _buildCard(
+                  Icons.flash_on,
+                  'Voltage (V)',
+                  _loadingLatestReadings
+                      ? null
+                      : _current?.voltage.toStringAsFixed(1) ?? '--',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildCard(
+                  Icons.speed,
+                  'Frequency (Hz)',
+                  _loadingLatestReadings
+                      ? null
+                      : _current?.frequency.toStringAsFixed(1) ?? '--',
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _buildCard(
+                  Icons.list_alt,
+                  'Power Factor',
+                  _loadingLatestReadings
+                      ? null
+                      : _current?.powerFactor.toStringAsFixed(2) ?? '--',
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+          if (_current != null && !_loadingLatestReadings) ...[
+            Text(
+              'Last Update: ${DateFormat('HH:mm:ss').format(_current!.dateTime)}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 14, color: Colors.black54),
             ),
+            const SizedBox(height: 16),
           ],
-        ),
-        const SizedBox(height: 12),
-        if (_current != null) ...[
-          Text(
-            'Last Update: ${DateFormat('HH:mm:ss').format(_current!.dateTime)}',
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 14, color: Colors.black54),
+
+          // Total Energy Since Reset (Wh)
+          _buildCard(
+            Icons.timeline,
+            'Total Energy Since Reset (Wh)',
+            _loadingTotalEnergy
+                ? null
+                : _totalEnergySinceReset.toStringAsFixed(1),
           ),
           const SizedBox(height: 16),
+
+          // Live Data Card (styled like other cards)
+          _buildCard(
+            Icons.sensors,
+            'Live Data',
+            null,
+            isButton: true,
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => ScanPage()),
+              );
+            },
+          ),
         ],
-        // Second row: Voltage, Frequency, Power Factor
-        Row(
-          children: [
-            Expanded(
-              child: _buildCard(
-                Icons.flash_on,
-                'Voltage (V)',
-                _current?.voltage.toStringAsFixed(1) ?? '--',
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildCard(
-                Icons.speed,
-                'Frequency (Hz)',
-                _current?.frequency.toStringAsFixed(1) ?? '--',
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _buildCard(
-                Icons.list_alt,
-                'Power Factor',
-                _current?.powerFactor.toStringAsFixed(2) ?? '--',
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        // Row: Total Energy Since Reset (Wh)
-        _buildCard(
-          Icons.timeline,
-          'Total Energy Since Reset (Wh)',
-          _totalEnergySinceReset.toStringAsFixed(1),
-        ),
-      ],
+      ),
     );
   }
 
-  Widget _buildCard(IconData icon, String label, String value) {
+  Widget _buildCard(
+    IconData icon,
+    String label,
+    String? value, {
+    bool isButton = false,
+    VoidCallback? onTap,
+  }) {
     return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Icon(icon, size: 32),
-            const SizedBox(height: 8),
-            Text(label, style: const TextStyle(fontSize: 16)),
-            const SizedBox(height: 4),
-            Text(
-              value,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-          ],
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Icon(
+                icon,
+                size: 32,
+                color: isButton ? Theme.of(context).primaryColor : null,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: isButton ? Theme.of(context).primaryColor : null,
+                ),
+              ),
+              if (!isButton) ...[
+                const SizedBox(height: 4),
+                value == null
+                    ? _buildShimmerEffect()
+                    : Text(
+                      value,
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+              ],
+            ],
+          ),
         ),
       ),
+    );
+  }
+
+  Widget _buildShimmerEffect() {
+    return Container(
+      width: 60,
+      height: 24,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(4),
+        gradient: const LinearGradient(
+          colors: [Color(0xFFE0E0E0), Color(0xFFF5F5F5), Color(0xFFE0E0E0)],
+          stops: [0.0, 0.5, 1.0],
+          begin: Alignment(-1.0, 0.0),
+          end: Alignment(1.0, 0.0),
+        ),
+      ),
+      child: const SizedBox(),
     );
   }
 }

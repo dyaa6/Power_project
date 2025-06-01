@@ -38,7 +38,7 @@ class MyApp extends StatelessWidget {
           elevatedButtonTheme: ElevatedButtonThemeData(
             style: ElevatedButton.styleFrom(
               foregroundColor: Colors.white,
-              backgroundColor: Colors.blue,
+              backgroundColor: const Color(0xFF075E54),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(8.0),
               ),
@@ -86,7 +86,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         body: IndexedStack(index: _selectedIndex, children: _widgetOptions),
         bottomNavigationBar: BottomNavigationBar(
           backgroundColor: Colors.white,
-          selectedItemColor: Colors.blue[800],
+          selectedItemColor: const Color(0xFF075E54),
           unselectedItemColor: Colors.grey[600],
           currentIndex: _selectedIndex,
           onTap: _onItemTapped,
